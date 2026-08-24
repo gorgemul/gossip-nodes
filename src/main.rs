@@ -10,6 +10,7 @@ enum MessageType {
     Init,
     Echo,
     Error,
+    Generate,
     #[serde(untagged)]
     Default(String),
 }
@@ -33,6 +34,7 @@ struct Message {
 struct Node {
     id: String,
     node_ids: Vec<String>,
+    counter: u64,
 }
 
 impl std::fmt::Display for MessageType {
@@ -41,15 +43,16 @@ impl std::fmt::Display for MessageType {
             MessageType::Init => "init",
             MessageType::Echo => "echo",
             MessageType::Error => "error",
+            MessageType::Generate => "generate",
             MessageType::Default(s) => s,
         };
         write!(f, "{}", s)
     }
 }
 
-impl MessageBody {
-    fn get_value<'a, T>(&'a self, key: &str, to_fn: fn(&'a Value) -> Option<T>) -> Result<T> {
-        let body = &self.extra;
+impl Message {
+    fn get_body_value<'a, T>(&'a self, key: &str, to_fn: fn(&'a Value) -> Option<T>) -> Result<T> {
+        let body = &self.body.extra;
         let value = body.get(key).context(format!(
             "Message body should contain '{}' field, message: {:?}",
             key, self
@@ -68,16 +71,21 @@ impl Node {
         Self {
             id: String::new(),
             node_ids: vec![],
+            counter: 0,
         }
     }
+    fn is_init(&self) -> bool {
+        !self.id.is_empty()
+    }
     fn init_handler(&mut self, request: Message) -> Result<()> {
-        if !self.id.is_empty() {
+        if self.is_init() {
+            // TODO: maybe return error?
             eprintln!("Init handler has been called before");
             return Ok(());
         }
-        let node_id = request.body.get_value("node_id", Value::as_str)?;
+        let node_id = request.get_body_value("node_id", Value::as_str)?;
         self.id = node_id.to_owned();
-        let node_ids = request.body.get_value("node_ids", Value::as_array)?;
+        let node_ids = request.get_body_value("node_ids", Value::as_array)?;
         for (i, id) in node_ids.iter().enumerate() {
             let id = id.as_str().context(format!(
                 "'node_ids' element {} is not a string type: {:?}",
@@ -91,12 +99,30 @@ impl Node {
         Ok(())
     }
     fn echo_handler(&self, request: Message) -> Result<()> {
+        if !self.is_init() {
+            eprintln!("Echo handler must be called after init handler");
+            return Ok(());
+        }
         let body = request.body.extra.clone();
         self.reply(request, body)?;
         Ok(())
     }
+    fn generate_handler(&mut self, request: Message) -> Result<()> {
+        if !self.is_init() {
+            eprintln!("Generate handler must be called after init handler");
+            return Ok(());
+        }
+        let mut body = HashMap::new();
+        body.insert(
+            String::from("id"),
+            json!(format!("{}#{}", self.id, self.counter)),
+        );
+        self.counter += 1;
+        self.reply(request, body)?;
+        Ok(())
+    }
     fn reply(&self, request: Message, mut body: HashMap<String, Value>) -> Result<()> {
-        let msg_id = request.body.get_value("msg_id", Value::as_u64)?;
+        let msg_id = request.get_body_value("msg_id", Value::as_u64)?;
         let response_type = format!("{}_ok", request.body.kind);
         body.entry(String::from("in_reply_to"))
             .and_modify(|v| *v = json!(msg_id))
@@ -132,6 +158,7 @@ impl Node {
             match message.body.kind {
                 MessageType::Init => self.init_handler(message)?,
                 MessageType::Echo => self.echo_handler(message)?,
+                MessageType::Generate => self.generate_handler(message)?,
                 MessageType::Error => unimplemented!(),
                 MessageType::Default(v) => eprintln!("Unsupported messsage type: {}", v),
             }
