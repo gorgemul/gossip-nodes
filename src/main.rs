@@ -47,9 +47,9 @@ impl std::fmt::Display for MessageType {
     }
 }
 
-impl Message {
-    fn get_body_value<'a, T>(&'a self, key: &str, to_fn: fn(&'a Value) -> Option<T>) -> Result<T> {
-        let body = &self.body.extra;
+impl MessageBody {
+    fn get_value<'a, T>(&'a self, key: &str, to_fn: fn(&'a Value) -> Option<T>) -> Result<T> {
+        let body = &self.extra;
         let value = body.get(key).context(format!(
             "Message body should contain '{}' field, message: {:?}",
             key, self
@@ -61,15 +61,6 @@ impl Message {
         ))?;
         Ok(value)
     }
-    fn set_responser(&mut self) -> Result<()> {
-        let msg_id = self.get_body_value("msg_id", Value::as_u64)?;
-        self.body
-            .extra
-            .entry(String::from("in_reply_to"))
-            .and_modify(|e| *e = json!(msg_id))
-            .or_insert(json!(msg_id));
-        Ok(())
-    }
 }
 
 impl Node {
@@ -79,14 +70,14 @@ impl Node {
             node_ids: vec![],
         }
     }
-    fn init_handler(&mut self, mut message: Message) -> Result<()> {
+    fn init_handler(&mut self, request: Message) -> Result<()> {
         if !self.id.is_empty() {
             eprintln!("Init handler has been called before");
             return Ok(());
         }
-        let node_id = message.get_body_value("node_id", Value::as_str)?;
+        let node_id = request.body.get_value("node_id", Value::as_str)?;
         self.id = node_id.to_owned();
-        let node_ids = message.get_body_value("node_ids", Value::as_array)?;
+        let node_ids = request.body.get_value("node_ids", Value::as_array)?;
         for (i, id) in node_ids.iter().enumerate() {
             let id = id.as_str().context(format!(
                 "'node_ids' element {} is not a string type: {:?}",
@@ -95,27 +86,33 @@ impl Node {
             ))?;
             self.node_ids.push(id.to_owned());
         }
-        message.set_responser()?;
-        self.reply(&message.src, message.body)?;
+        self.reply(request, HashMap::new())?;
         eprintln!("Init node successs: {:?}", self);
         Ok(())
     }
-    fn echo_handler(&self, mut message: Message) -> Result<()> {
-        message.set_responser()?;
-        self.reply(&message.src, message.body)?;
+    fn echo_handler(&self, request: Message) -> Result<()> {
+        let body = request.body.extra.clone();
+        self.reply(request, body)?;
         Ok(())
     }
-    fn reply(&self, dest: &str, body: MessageBody) -> Result<()> {
-        let mut message = json!({
+    fn reply(&self, request: Message, mut body: HashMap<String, Value>) -> Result<()> {
+        let msg_id = request.body.get_value("msg_id", Value::as_u64)?;
+        let response_type = format!("{}_ok", request.body.kind);
+        body.entry(String::from("in_reply_to"))
+            .and_modify(|v| *v = json!(msg_id))
+            .or_insert(json!(msg_id));
+        body.entry(String::from("type"))
+            .and_modify(|v| *v = json!(response_type))
+            .or_insert(json!(response_type));
+        self.send(&request.src, body)?;
+        Ok(())
+    }
+    fn send(&self, dest: &str, body: HashMap<String, Value>) -> Result<()> {
+        let message = json!({
             "src": &self.id,
             "dest": dest,
-            "body": {
-                "type": format!("{}_ok", body.kind),
-            },
+            "body": body,
         });
-        for (k, v) in body.extra.into_iter() {
-            message["body"][k] = v;
-        }
         let mut stdout = io::stdout().lock();
         eprintln!(
             "'{}' send message to '{}':\n {}",
@@ -123,7 +120,7 @@ impl Node {
             dest,
             to_string_pretty(&message)?,
         );
-        writeln!(stdout, "{}", message.to_string())?;
+        writeln!(stdout, "{}", message)?;
         Ok(())
     }
     fn run(&mut self) -> Result<()> {
