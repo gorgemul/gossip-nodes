@@ -4,6 +4,8 @@ use serde_json::{Value, json, to_string_pretty};
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+type Handler = fn(&mut Node, Message) -> Result<()>;
+
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 enum MessageType {
@@ -36,6 +38,7 @@ struct Message {
 #[derive(Debug)]
 struct Node {
     id: String,
+    handlers: HashMap<MessageType, Handler>,
     neighbors: Vec<String>,
     messages: Vec<Value>,
     counter: u64,
@@ -80,101 +83,109 @@ impl Message {
 }
 
 impl Node {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self> {
+        let mut handlers: HashMap<MessageType, Handler> = HashMap::new();
+        // register init handler
+        handlers.insert(MessageType::Init, |node, request| {
+            if node.is_init() {
+                // TODO: maybe return error?
+                eprintln!("Init handler has been called before");
+                return Ok(());
+            }
+            let node_id = request.get_body_value("node_id", Value::as_str)?;
+            node.id = node_id.to_owned();
+            let neighbors = request.get_body_value("node_ids", Value::as_array)?;
+            for (i, id) in neighbors.iter().enumerate() {
+                let id = id.as_str().context(format!(
+                    "'node_ids' element {} is not a string type: {:?}",
+                    i + 1,
+                    id
+                ))?;
+                if id != node.id {
+                    node.neighbors.push(id.to_owned());
+                }
+            }
+            node.reply(request, HashMap::new())?;
+            eprintln!("Init node successs: {:?}", node);
+            Ok(())
+        });
+        // register echo handler
+        handlers.insert(MessageType::Echo, |node, request| {
+            if !node.is_init() {
+                eprintln!("Echo handler must be called after init handler");
+                return Ok(());
+            }
+            let body = request.body.extra.clone();
+            node.reply(request, body)?;
+            Ok(())
+        });
+        // register generate handler
+        handlers.insert(MessageType::Generate, |node, request| {
+            if !node.is_init() {
+                eprintln!("Generate handler must be called after init handler");
+                return Ok(());
+            }
+            let mut body = HashMap::new();
+            body.insert(
+                String::from("id"),
+                json!(format!("{}#{}", node.id, node.counter)),
+            );
+            node.counter += 1;
+            node.reply(request, body)?;
+            Ok(())
+        });
+        // register topology handler
+        // NOTE: only reply ok to the request, we get the neighbor info when init the node
+        handlers.insert(MessageType::Topology, |node, request| {
+            if !node.is_init() {
+                eprintln!("Topology handler must be called after init handler");
+                return Ok(());
+            }
+            node.reply(request, HashMap::new())?;
+            Ok(())
+        });
+        // register broadcast handler
+        handlers.insert(MessageType::Broadcast, |node, request| {
+            if !node.is_init() {
+                eprintln!("broadcast handler must be called after init handler");
+                return Ok(());
+            }
+            let message = request.get_body_value_raw("message")?;
+            node.messages.push(message.to_owned());
+            for neighbor in &node.neighbors {
+                if *neighbor == request.src {
+                    continue;
+                }
+                let mut body: HashMap<String, Value> = HashMap::new();
+                body.insert(String::from("type"), json!("broadcast"));
+                body.insert(String::from("message"), message.to_owned());
+                node.send(neighbor, body)?;
+            }
+            node.reply(request, HashMap::new())?;
+            Ok(())
+        });
+        // register read handler
+        handlers.insert(MessageType::Read, |node, request| {
+            if !node.is_init() {
+                eprintln!("read handler must be called after init handler");
+                return Ok(());
+            }
+            let mut body: HashMap<String, Value> = HashMap::new();
+            body.insert(String::from("type"), json!("read"));
+            body.insert(String::from("messages"), json!(node.messages.clone()));
+            node.reply(request, body)?;
+            Ok(())
+        });
+        Ok(Self {
             id: String::new(),
+            handlers,
             counter: 0,
             neighbors: vec![],
             messages: vec![],
-        }
+        })
     }
     fn is_init(&self) -> bool {
         !self.id.is_empty()
-    }
-    fn init_handler(&mut self, request: Message) -> Result<()> {
-        if self.is_init() {
-            // TODO: maybe return error?
-            eprintln!("Init handler has been called before");
-            return Ok(());
-        }
-        let node_id = request.get_body_value("node_id", Value::as_str)?;
-        self.id = node_id.to_owned();
-        let neighbors = request.get_body_value("node_ids", Value::as_array)?;
-        for (i, id) in neighbors.iter().enumerate() {
-            let id = id.as_str().context(format!(
-                "'node_ids' element {} is not a string type: {:?}",
-                i + 1,
-                id
-            ))?;
-            if id != self.id {
-                self.neighbors.push(id.to_owned());
-            }
-        }
-        self.reply(request, HashMap::new())?;
-        eprintln!("Init node successs: {:?}", self);
-        Ok(())
-    }
-    fn echo_handler(&self, request: Message) -> Result<()> {
-        if !self.is_init() {
-            eprintln!("Echo handler must be called after init handler");
-            return Ok(());
-        }
-        let body = request.body.extra.clone();
-        self.reply(request, body)?;
-        Ok(())
-    }
-    fn generate_handler(&mut self, request: Message) -> Result<()> {
-        if !self.is_init() {
-            eprintln!("Generate handler must be called after init handler");
-            return Ok(());
-        }
-        let mut body = HashMap::new();
-        body.insert(
-            String::from("id"),
-            json!(format!("{}#{}", self.id, self.counter)),
-        );
-        self.counter += 1;
-        self.reply(request, body)?;
-        Ok(())
-    }
-    // NOTE: only reply ok to the request, we get the neighbor info when init the node
-    fn topology_handler(&self, request: Message) -> Result<()> {
-        if !self.is_init() {
-            eprintln!("Topology handler must be called after init handler");
-            return Ok(());
-        }
-        self.reply(request, HashMap::new())?;
-        Ok(())
-    }
-    fn broadcast_handler(&mut self, request: Message) -> Result<()> {
-        if !self.is_init() {
-            eprintln!("broadcast handler must be called after init handler");
-            return Ok(());
-        }
-        let message = request.get_body_value_raw("message")?;
-        self.messages.push(message.to_owned());
-        for neighbor in &self.neighbors {
-            if *neighbor == request.src {
-                continue;
-            }
-            let mut body: HashMap<String, Value> = HashMap::new();
-            body.insert(String::from("type"), json!("broadcast"));
-            body.insert(String::from("message"), message.to_owned());
-            self.send(neighbor, body)?;
-        }
-        self.reply(request, HashMap::new())?;
-        Ok(())
-    }
-    fn read_handler(&self, request: Message) -> Result<()> {
-        if !self.is_init() {
-            eprintln!("read handler must be called after init handler");
-            return Ok(());
-        }
-        let mut body: HashMap<String, Value> = HashMap::new();
-        body.insert(String::from("type"), json!("read"));
-        body.insert(String::from("messages"), json!(self.messages.clone()));
-        self.reply(request, body)?;
-        Ok(())
     }
     fn reply(&self, request: Message, mut body: HashMap<String, Value>) -> Result<()> {
         let msg_id = request.get_body_value("msg_id", Value::as_u64)?;
@@ -210,24 +221,19 @@ impl Node {
             let line = line.context("reading line from stdin fail")?;
             let message: Message = serde_json::from_str(&line)
                 .context(format!("message is not valid json format: {}", line))?;
-            match message.body.kind {
-                MessageType::Init => self.init_handler(message)?,
-                MessageType::Echo => self.echo_handler(message)?,
-                MessageType::Error => unimplemented!(),
-                MessageType::Generate => self.generate_handler(message)?,
-                MessageType::Topology => self.topology_handler(message)?,
-                MessageType::Broadcast => self.broadcast_handler(message)?,
-                MessageType::Read => self.read_handler(message)?,
-                MessageType::Default(v) => eprintln!("Unsupported messsage type: {}", v),
-            }
+            let Some(handler) = self.handlers.get(&message.body.kind) else {
+                eprintln!("Unsupported messsage type: {}", message.body.kind);
+                continue;
+            };
+            handler(self, message)?;
         }
         Ok(())
     }
 }
 
 fn main() {
-    let mut node = Node::new();
+    let mut node = Node::new().expect("Node init fail");
     if let Err(err) = node.run() {
-        eprintln!("Echo node running error: {:?}", err);
+        eprintln!("Node running error: {:?}", err);
     }
 }
