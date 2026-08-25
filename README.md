@@ -41,6 +41,13 @@ Against the Maelstrom unique id generation workload:
 --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
 ```
 
+Against the Maelstrom single node broadcast workload:
+
+```sh
+./maelstrom test -w broadcast --bin /path/to/gossip-nodes/target/release/gossip-nodes \ 
+--node-count 1 --time-limit 20 --rate 10
+```
+
 Run it by hand by piping JSON lines into the binary:
 
 ```sh

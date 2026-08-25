@@ -11,6 +11,9 @@ enum MessageType {
     Echo,
     Error,
     Generate,
+    Topology,
+    Broadcast,
+    Read,
     #[serde(untagged)]
     Default(String),
 }
@@ -33,7 +36,8 @@ struct Message {
 #[derive(Debug)]
 struct Node {
     id: String,
-    node_ids: Vec<String>,
+    neighbors: Vec<String>,
+    messages: Vec<Value>,
     counter: u64,
 }
 
@@ -44,6 +48,9 @@ impl std::fmt::Display for MessageType {
             MessageType::Echo => "echo",
             MessageType::Error => "error",
             MessageType::Generate => "generate",
+            MessageType::Topology => "topology",
+            MessageType::Broadcast => "broadcast",
+            MessageType::Read => "read",
             MessageType::Default(s) => s,
         };
         write!(f, "{}", s)
@@ -64,14 +71,21 @@ impl Message {
         ))?;
         Ok(value)
     }
+    fn get_body_value_raw(&self, key: &str) -> Result<&Value> {
+        self.body.extra.get(key).context(format!(
+            "Message body should contain '{}' field, message: {:?}",
+            key, self
+        ))
+    }
 }
 
 impl Node {
     fn new() -> Self {
         Self {
             id: String::new(),
-            node_ids: vec![],
             counter: 0,
+            neighbors: vec![],
+            messages: vec![],
         }
     }
     fn is_init(&self) -> bool {
@@ -85,14 +99,16 @@ impl Node {
         }
         let node_id = request.get_body_value("node_id", Value::as_str)?;
         self.id = node_id.to_owned();
-        let node_ids = request.get_body_value("node_ids", Value::as_array)?;
-        for (i, id) in node_ids.iter().enumerate() {
+        let neighbors = request.get_body_value("node_ids", Value::as_array)?;
+        for (i, id) in neighbors.iter().enumerate() {
             let id = id.as_str().context(format!(
                 "'node_ids' element {} is not a string type: {:?}",
                 i + 1,
                 id
             ))?;
-            self.node_ids.push(id.to_owned());
+            if id != self.id {
+                self.neighbors.push(id.to_owned());
+            }
         }
         self.reply(request, HashMap::new())?;
         eprintln!("Init node successs: {:?}", self);
@@ -118,6 +134,45 @@ impl Node {
             json!(format!("{}#{}", self.id, self.counter)),
         );
         self.counter += 1;
+        self.reply(request, body)?;
+        Ok(())
+    }
+    // NOTE: only reply ok to the request, we get the neighbor info when init the node
+    fn topology_handler(&self, request: Message) -> Result<()> {
+        if !self.is_init() {
+            eprintln!("Topology handler must be called after init handler");
+            return Ok(());
+        }
+        self.reply(request, HashMap::new())?;
+        Ok(())
+    }
+    fn broadcast_handler(&mut self, request: Message) -> Result<()> {
+        if !self.is_init() {
+            eprintln!("broadcast handler must be called after init handler");
+            return Ok(());
+        }
+        let message = request.get_body_value_raw("message")?;
+        self.messages.push(message.to_owned());
+        for neighbor in &self.neighbors {
+            if *neighbor == request.src {
+                continue;
+            }
+            let mut body: HashMap<String, Value> = HashMap::new();
+            body.insert(String::from("type"), json!("broadcast"));
+            body.insert(String::from("message"), message.to_owned());
+            self.send(neighbor, body)?;
+        }
+        self.reply(request, HashMap::new())?;
+        Ok(())
+    }
+    fn read_handler(&self, request: Message) -> Result<()> {
+        if !self.is_init() {
+            eprintln!("read handler must be called after init handler");
+            return Ok(());
+        }
+        let mut body: HashMap<String, Value> = HashMap::new();
+        body.insert(String::from("type"), json!("read"));
+        body.insert(String::from("messages"), json!(self.messages.clone()));
         self.reply(request, body)?;
         Ok(())
     }
@@ -158,8 +213,11 @@ impl Node {
             match message.body.kind {
                 MessageType::Init => self.init_handler(message)?,
                 MessageType::Echo => self.echo_handler(message)?,
-                MessageType::Generate => self.generate_handler(message)?,
                 MessageType::Error => unimplemented!(),
+                MessageType::Generate => self.generate_handler(message)?,
+                MessageType::Topology => self.topology_handler(message)?,
+                MessageType::Broadcast => self.broadcast_handler(message)?,
+                MessageType::Read => self.read_handler(message)?,
                 MessageType::Default(v) => eprintln!("Unsupported messsage type: {}", v),
             }
         }
