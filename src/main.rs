@@ -39,9 +39,10 @@ struct Message {
 struct Node {
     id: String,
     handlers: HashMap<MessageType, Handler>,
+    callbacks: HashMap<u64, Handler>,
     neighbors: Vec<String>,
     messages: Vec<Value>,
-    counter: u64,
+    msg_id: u64,
 }
 
 impl std::fmt::Display for MessageType {
@@ -106,7 +107,6 @@ impl Node {
                 }
             }
             node.reply(request, HashMap::new())?;
-            eprintln!("Init node successs: {:?}", node);
             Ok(())
         });
         // register echo handler
@@ -126,11 +126,8 @@ impl Node {
                 return Ok(());
             }
             let mut body = HashMap::new();
-            body.insert(
-                String::from("id"),
-                json!(format!("{}#{}", node.id, node.counter)),
-            );
-            node.counter += 1;
+            let msg_id = node.get_next_msg_id();
+            body.insert(String::from("id"), json!(format!("{}#{}", node.id, msg_id)));
             node.reply(request, body)?;
             Ok(())
         });
@@ -151,15 +148,19 @@ impl Node {
                 return Ok(());
             }
             let message = request.get_body_value_raw("message")?;
+            if node.messages.contains(message) {
+                node.reply(request, HashMap::new())?;
+                return Ok(());
+            }
             node.messages.push(message.to_owned());
-            for neighbor in &node.neighbors {
-                if *neighbor == request.src {
+            for neighbor in node.neighbors.clone() {
+                if neighbor == request.src {
                     continue;
                 }
                 let mut body: HashMap<String, Value> = HashMap::new();
                 body.insert(String::from("type"), json!("broadcast"));
                 body.insert(String::from("message"), message.to_owned());
-                node.send(neighbor, body)?;
+                node.rpc(&neighbor, body, None)?;
             }
             node.reply(request, HashMap::new())?;
             Ok(())
@@ -179,13 +180,32 @@ impl Node {
         Ok(Self {
             id: String::new(),
             handlers,
-            counter: 0,
+            callbacks: HashMap::new(),
+            msg_id: 0,
             neighbors: vec![],
             messages: vec![],
         })
     }
     fn is_init(&self) -> bool {
         !self.id.is_empty()
+    }
+    fn get_next_msg_id(&mut self) -> u64 {
+        self.msg_id += 1;
+        self.msg_id
+    }
+    fn rpc(
+        &mut self,
+        dest: &str,
+        mut body: HashMap<String, Value>,
+        callback: Option<Handler>,
+    ) -> Result<()> {
+        let msg_id = self.get_next_msg_id();
+        body.insert(String::from("msg_id"), json!(msg_id));
+        if let Some(callback) = callback {
+            self.callbacks.insert(msg_id, callback);
+        }
+        self.send(dest, body)?;
+        Ok(())
     }
     fn reply(&self, request: Message, mut body: HashMap<String, Value>) -> Result<()> {
         let msg_id = request.get_body_value("msg_id", Value::as_u64)?;
@@ -216,16 +236,23 @@ impl Node {
         Ok(())
     }
     fn run(&mut self) -> Result<()> {
-        let lines = io::stdin().lines();
-        for line in lines {
-            let line = line.context("reading line from stdin fail")?;
-            let message: Message = serde_json::from_str(&line)
-                .context(format!("message is not valid json format: {}", line))?;
-            let Some(handler) = self.handlers.get(&message.body.kind) else {
-                eprintln!("Unsupported messsage type: {}", message.body.kind);
+        let requests = io::stdin().lines();
+        for request in requests {
+            let request = request.context("reading raw request from stdin fail")?;
+            let request: Message = serde_json::from_str(&request)
+                .context(format!("request is not valid json format: {}", request))?;
+            if let Ok(msg_id) = request.get_body_value("in_reply_to", Value::as_u64) {
+                let Some(callback) = self.callbacks.get(&msg_id) else {
+                    continue;
+                };
+                callback(self, request)?;
+                continue;
+            }
+            let Some(handler) = self.handlers.get(&request.body.kind) else {
+                eprintln!("Unsupported messsage type: {}", request.body.kind);
                 continue;
             };
-            handler(self, message)?;
+            handler(self, request)?;
         }
         Ok(())
     }
