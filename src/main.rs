@@ -3,8 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, to_string_pretty};
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex, RwLock};
+use std::{fmt, thread};
 
-type Handler = fn(&mut Node, Message) -> Result<()>;
+// Handler use fn pointer since it is stateless
+type Handler = fn(Arc<Node>, Message) -> Result<()>;
+// Callback use closure since it need to capture the channel for sync rpc
+type Callback = Box<dyn FnOnce(Arc<Node>, Message) -> Result<()> + Send>;
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -35,14 +40,18 @@ struct Message {
     body: MessageBody,
 }
 
-#[derive(Debug)]
-struct Node {
-    id: String,
-    handlers: HashMap<MessageType, Handler>,
-    callbacks: HashMap<u64, Handler>,
-    neighbors: Vec<String>,
+struct NodeState {
+    callbacks: HashMap<u64, Callback>,
     messages: Vec<Value>,
     msg_id: u64,
+}
+
+#[derive(Debug)]
+struct Node {
+    id: RwLock<String>,
+    handlers: RwLock<HashMap<MessageType, Handler>>,
+    neighbors: RwLock<Vec<String>>,
+    state: Mutex<NodeState>,
 }
 
 impl std::fmt::Display for MessageType {
@@ -58,6 +67,17 @@ impl std::fmt::Display for MessageType {
             MessageType::Default(s) => s,
         };
         write!(f, "{}", s)
+    }
+}
+
+// Not use #[derive(Debug)] is because Callbacks doesn't have the default debug impl
+impl fmt::Debug for NodeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeState")
+            .field("callbacks", &self.callbacks.keys().collect::<Vec<_>>())
+            .field("messages", &self.messages)
+            .field("msg_id", &self.msg_id)
+            .finish()
     }
 }
 
@@ -94,7 +114,7 @@ impl Node {
                 return Ok(());
             }
             let node_id = request.get_body_value("node_id", Value::as_str)?;
-            node.id = node_id.to_owned();
+            *node.id.write().unwrap() = node_id.to_owned();
             let neighbors = request.get_body_value("node_ids", Value::as_array)?;
             for (i, id) in neighbors.iter().enumerate() {
                 let id = id.as_str().context(format!(
@@ -102,8 +122,8 @@ impl Node {
                     i + 1,
                     id
                 ))?;
-                if id != node.id {
-                    node.neighbors.push(id.to_owned());
+                if id != node_id {
+                    (node.neighbors.write().unwrap()).push(id.to_owned());
                 }
             }
             node.reply(request, HashMap::new())?;
@@ -127,7 +147,10 @@ impl Node {
             }
             let mut body = HashMap::new();
             let msg_id = node.get_next_msg_id();
-            body.insert(String::from("id"), json!(format!("{}#{}", node.id, msg_id)));
+            body.insert(
+                String::from("id"),
+                json!(format!("{}#{}", node.id.read().unwrap(), msg_id)),
+            );
             node.reply(request, body)?;
             Ok(())
         });
@@ -148,19 +171,26 @@ impl Node {
                 return Ok(());
             }
             let message = request.get_body_value_raw("message")?;
-            if node.messages.contains(message) {
-                node.reply(request, HashMap::new())?;
-                return Ok(());
+            {
+                let messages = &mut node
+                    .state
+                    .lock()
+                    .expect("Fail to get lock in broadcast handler")
+                    .messages;
+                if messages.contains(message) {
+                    node.reply(request, HashMap::new())?;
+                    return Ok(());
+                }
+                messages.push(message.to_owned());
             }
-            node.messages.push(message.to_owned());
-            for neighbor in node.neighbors.clone() {
-                if neighbor == request.src {
+            for neighbor in &*node.neighbors.read().unwrap() {
+                if *neighbor == request.src {
                     continue;
                 }
                 let mut body: HashMap<String, Value> = HashMap::new();
                 body.insert(String::from("type"), json!("broadcast"));
                 body.insert(String::from("message"), message.to_owned());
-                node.rpc(&neighbor, body, None)?;
+                node.rpc(neighbor, body, None)?;
             }
             node.reply(request, HashMap::new())?;
             Ok(())
@@ -173,36 +203,60 @@ impl Node {
             }
             let mut body: HashMap<String, Value> = HashMap::new();
             body.insert(String::from("type"), json!("read"));
-            body.insert(String::from("messages"), json!(node.messages.clone()));
+            body.insert(
+                String::from("messages"),
+                json!(
+                    node.state
+                        .lock()
+                        .expect("Fail to get lock in read handler")
+                        .messages
+                        .clone()
+                ),
+            );
             node.reply(request, body)?;
             Ok(())
         });
-        Ok(Self {
-            id: String::new(),
-            handlers,
+        let state = Mutex::new(NodeState {
             callbacks: HashMap::new(),
             msg_id: 0,
-            neighbors: vec![],
             messages: vec![],
+        });
+        Ok(Self {
+            id: RwLock::new(String::new()),
+            neighbors: RwLock::new(vec![]),
+            handlers: RwLock::new(handlers),
+            state,
         })
     }
     fn is_init(&self) -> bool {
-        !self.id.is_empty()
+        !self
+            .id
+            .read()
+            .expect("Fail to get read lock in is_init")
+            .is_empty()
     }
-    fn get_next_msg_id(&mut self) -> u64 {
-        self.msg_id += 1;
-        self.msg_id
+    fn get_next_msg_id(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Fail to get lock in get_next_msg_id");
+        state.msg_id += 1;
+        state.msg_id
     }
     fn rpc(
-        &mut self,
+        &self,
         dest: &str,
         mut body: HashMap<String, Value>,
-        callback: Option<Handler>,
+        callback: Option<Callback>,
     ) -> Result<()> {
         let msg_id = self.get_next_msg_id();
         body.insert(String::from("msg_id"), json!(msg_id));
         if let Some(callback) = callback {
-            self.callbacks.insert(msg_id, callback);
+            self.state
+                .lock()
+                .expect("Fail to get lock in rpc")
+                .callbacks
+                .insert(msg_id, callback);
         }
         self.send(dest, body)?;
         Ok(())
@@ -228,38 +282,62 @@ impl Node {
         let mut stdout = io::stdout().lock();
         eprintln!(
             "'{}' send message to '{}':\n {}",
-            self.id,
+            self.id.read().unwrap(),
             dest,
             to_string_pretty(&message)?,
         );
         writeln!(stdout, "{}", message)?;
         Ok(())
     }
-    fn run(&mut self) -> Result<()> {
+    fn run(self: Arc<Self>) -> Result<()> {
         let requests = io::stdin().lines();
         for request in requests {
             let request = request.context("reading raw request from stdin fail")?;
             let request: Message = serde_json::from_str(&request)
                 .context(format!("request is not valid json format: {}", request))?;
             if let Ok(msg_id) = request.get_body_value("in_reply_to", Value::as_u64) {
-                let Some(callback) = self.callbacks.get(&msg_id) else {
+                let Some(callback) = self
+                    .state
+                    .lock()
+                    .expect("Fail to get lock in run")
+                    .callbacks
+                    .remove(&msg_id)
+                else {
                     continue;
                 };
-                callback(self, request)?;
+                let node = self.clone();
+                thread::spawn(move || {
+                    if let Err(err) = callback(node, request) {
+                        eprintln!("Call back error: {:?}", err);
+                    }
+                });
                 continue;
             }
-            let Some(handler) = self.handlers.get(&request.body.kind) else {
+            // Since thread::spawn need a handler which life time should be 'static, and
+            // handler's life time is binding to self, so we need to make a copy of it
+            let Some(handler) = self
+                .handlers
+                .read()
+                .unwrap()
+                .get(&request.body.kind)
+                .copied()
+            else {
                 eprintln!("Unsupported messsage type: {}", request.body.kind);
                 continue;
             };
-            handler(self, request)?;
+            let node = self.clone();
+            thread::spawn(move || {
+                if let Err(err) = handler(node, request) {
+                    eprintln!("Handler error: {:?}", err);
+                }
+            });
         }
         Ok(())
     }
 }
 
 fn main() {
-    let mut node = Node::new().expect("Node init fail");
+    let node = Arc::new(Node::new().expect("Node init fail"));
     if let Err(err) = node.run() {
         eprintln!("Node running error: {:?}", err);
     }
