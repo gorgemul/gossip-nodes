@@ -1,15 +1,40 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json, to_string_pretty};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::{fmt, thread};
+mod kv;
 
 // Handler use fn pointer since it is stateless
 type Handler = fn(Arc<Node>, Message) -> Result<()>;
 // Callback use closure since it need to capture the channel for sync rpc
-type Callback = Box<dyn FnOnce(Arc<Node>, Message) -> Result<()> + Send>;
+type Callback = Box<dyn FnOnce(Arc<Node>, Message) -> Result<()> + Send + Sync>;
+
+#[repr(u64)]
+enum RpcCode {
+    Crash = 13,
+}
+
+// Different maelstrom workloads expect a different `read_ok` shape, and each one rejects
+// keys it doesn't know about, so the read handler has to pick exactly one of them.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Workload {
+    // https://fly.io/dist-sys/3a/ -> {"type":"read_ok","messages":[...]}
+    Broadcast,
+    // https://fly.io/dist-sys/4/  -> {"type":"read_ok","value":123}
+    Counter,
+}
+
+impl Workload {
+    fn from_env() -> Self {
+        match std::env::var("WORKLOAD").as_deref() {
+            Ok("counter") | Ok("g-counter") => Workload::Counter,
+            _ => Workload::Broadcast,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +46,7 @@ enum MessageType {
     Topology,
     Broadcast,
     Read,
+    Add,
     #[serde(untagged)]
     Default(String),
 }
@@ -46,8 +72,10 @@ struct NodeState {
     msg_id: u64,
 }
 
+// TODO: maybe restrucutre the field, is kinda ugly right now
 #[derive(Debug)]
-struct Node {
+pub struct Node {
+    workload: Workload,
     id: RwLock<String>,
     handlers: RwLock<HashMap<MessageType, Handler>>,
     neighbors: RwLock<Vec<String>>,
@@ -64,6 +92,7 @@ impl std::fmt::Display for MessageType {
             MessageType::Topology => "topology",
             MessageType::Broadcast => "broadcast",
             MessageType::Read => "read",
+            MessageType::Add => "add",
             MessageType::Default(s) => s,
         };
         write!(f, "{}", s)
@@ -101,16 +130,33 @@ impl Message {
             key, self
         ))
     }
+    // None: indicate success
+    // Some(code: u64, text: String) indicate error
+    fn is_rpc_error(&self) -> Option<(u64, String)> {
+        if self.body.kind != MessageType::Error {
+            return None;
+        }
+        let code = match self.get_body_value("code", Value::as_u64) {
+            Ok(code) => code,
+            Err(err) => return Some((RpcCode::Crash as u64, err.to_string())),
+        };
+        if code == 0 {
+            return None;
+        }
+        let text = match self.get_body_value("text", Value::as_str) {
+            Ok(text) => text.to_owned(),
+            Err(err) => return Some((RpcCode::Crash as u64, err.to_string())),
+        };
+        Some((code, text))
+    }
 }
 
 impl Node {
-    fn new() -> Result<Self> {
+    fn new(workload: Workload) -> Result<Self> {
         let mut handlers: HashMap<MessageType, Handler> = HashMap::new();
         // register init handler
         handlers.insert(MessageType::Init, |node, request| {
             if node.is_init() {
-                // TODO: maybe return error?
-                eprintln!("Init handler has been called before");
                 return Ok(());
             }
             let node_id = request.get_body_value("node_id", Value::as_str)?;
@@ -131,20 +177,12 @@ impl Node {
         });
         // register echo handler
         handlers.insert(MessageType::Echo, |node, request| {
-            if !node.is_init() {
-                eprintln!("Echo handler must be called after init handler");
-                return Ok(());
-            }
             let body = request.body.extra.clone();
             node.reply(request, body)?;
             Ok(())
         });
         // register generate handler
         handlers.insert(MessageType::Generate, |node, request| {
-            if !node.is_init() {
-                eprintln!("Generate handler must be called after init handler");
-                return Ok(());
-            }
             let mut body = HashMap::new();
             let msg_id = node.get_next_msg_id();
             body.insert(
@@ -157,19 +195,11 @@ impl Node {
         // register topology handler
         // NOTE: only reply ok to the request, we get the neighbor info when init the node
         handlers.insert(MessageType::Topology, |node, request| {
-            if !node.is_init() {
-                eprintln!("Topology handler must be called after init handler");
-                return Ok(());
-            }
             node.reply(request, HashMap::new())?;
             Ok(())
         });
         // register broadcast handler
         handlers.insert(MessageType::Broadcast, |node, request| {
-            if !node.is_init() {
-                eprintln!("broadcast handler must be called after init handler");
-                return Ok(());
-            }
             let message = request.get_body_value_raw("message")?;
             {
                 let messages = &mut node
@@ -188,7 +218,10 @@ impl Node {
                     continue;
                 }
                 let mut body: HashMap<String, Value> = HashMap::new();
-                body.insert(String::from("type"), json!("broadcast"));
+                body.insert(
+                    String::from("type"),
+                    json!(MessageType::Broadcast.to_string()),
+                );
                 body.insert(String::from("message"), message.to_owned());
                 node.rpc(neighbor, body, None)?;
             }
@@ -196,24 +229,44 @@ impl Node {
             Ok(())
         });
         // register read handler
+        // NOTE: the broadcast workload rejects a 'value' key and the counter workload rejects
+        // a 'messages' key, so the reply body only carries the field for the active workload.
         handlers.insert(MessageType::Read, |node, request| {
-            if !node.is_init() {
-                eprintln!("read handler must be called after init handler");
-                return Ok(());
-            }
             let mut body: HashMap<String, Value> = HashMap::new();
-            body.insert(String::from("type"), json!("read"));
-            body.insert(
-                String::from("messages"),
-                json!(
-                    node.state
+            match node.workload {
+                Workload::Broadcast => {
+                    let messages = node
+                        .state
                         .lock()
                         .expect("Fail to get lock in read handler")
                         .messages
-                        .clone()
-                ),
-            );
+                        .clone();
+                    body.insert(String::from("messages"), json!(messages));
+                }
+                Workload::Counter => {
+                    let value = loop {
+                        match kv::seq_kv_read_u64_fresh(&node) {
+                            Ok(value) => break value,
+                            Err(err) => eprintln!("retry: {}", err),
+                        }
+                    };
+                    body.insert(String::from("value"), json!(value));
+                }
+            }
             node.reply(request, body)?;
+            Ok(())
+        });
+        // register add handler
+        handlers.insert(MessageType::Add, |node, request| {
+            let delta = request.get_body_value("delta", Value::as_u64)?;
+            loop {
+                let value = kv::seq_kv_read_u64(&node).unwrap_or(0);
+                match kv::seq_kv_compare_and_swap_u64(&node, value, value + delta) {
+                    Ok(()) => break,
+                    Err(err) => eprintln!("retry: {}", err),
+                }
+            }
+            node.reply(request, HashMap::new())?;
             Ok(())
         });
         let state = Mutex::new(NodeState {
@@ -222,6 +275,7 @@ impl Node {
             messages: vec![],
         });
         Ok(Self {
+            workload,
             id: RwLock::new(String::new()),
             neighbors: RwLock::new(vec![]),
             handlers: RwLock::new(handlers),
@@ -261,6 +315,23 @@ impl Node {
         self.send(dest, body)?;
         Ok(())
     }
+    fn rpc_sync(&self, dest: &str, body: HashMap<String, Value>) -> Result<Message> {
+        let (tx, rx) = mpsc::channel::<Message>();
+        self.rpc(
+            dest,
+            body,
+            Some(Box::new(move |_, message| {
+                tx.send(message).expect("Rpc sync send message fail");
+                Ok(())
+            })),
+        )?;
+        // TODO: maybe add a timeout for this, right now is waiting permanently
+        let message = rx.recv()?;
+        if let Some((code, text)) = message.is_rpc_error() {
+            bail!("Rpc error: code={}, text={}", code, text);
+        }
+        Ok(message)
+    }
     fn reply(&self, request: Message, mut body: HashMap<String, Value>) -> Result<()> {
         let msg_id = request.get_body_value("msg_id", Value::as_u64)?;
         let response_type = format!("{}_ok", request.body.kind);
@@ -281,10 +352,11 @@ impl Node {
         });
         let mut stdout = io::stdout().lock();
         eprintln!(
-            "'{}' send message to '{}':\n {}",
+            "[{}] {} -> {}: {:?}",
+            body.get("type").unwrap(),
             self.id.read().unwrap(),
             dest,
-            to_string_pretty(&message)?,
+            message.to_string()
         );
         writeln!(stdout, "{}", message)?;
         Ok(())
@@ -295,6 +367,14 @@ impl Node {
             let request = request.context("reading raw request from stdin fail")?;
             let request: Message = serde_json::from_str(&request)
                 .context(format!("request is not valid json format: {}", request))?;
+            eprintln!(
+                "[{}] {} <- {}: {:?}",
+                request.body.kind, request.dest, request.src, request.body.extra
+            );
+            // TODO: can do better
+            while !self.is_init() && request.body.kind != MessageType::Init {
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
             if let Ok(msg_id) = request.get_body_value("in_reply_to", Value::as_u64) {
                 let Some(callback) = self
                     .state
@@ -337,7 +417,7 @@ impl Node {
 }
 
 fn main() {
-    let node = Arc::new(Node::new().expect("Node init fail"));
+    let node = Arc::new(Node::new(Workload::from_env()).expect("Node init fail"));
     if let Err(err) = node.run() {
         eprintln!("Node running error: {:?}", err);
     }

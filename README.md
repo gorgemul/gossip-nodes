@@ -63,3 +63,10 @@ Multiple nodes broadcast workload:
 ./maelstrom test -w broadcast --bin /path/to/gossip-nodes/target/release/gossip-nodes \ 
 --node-count 5 --time-limit 20 --rate 10
 ```
+
+Grow only counter workload
+
+```sh
+WORKLOAD=counter ./maelstrom test -w g-counter --bin /path/to/gossip-nodes/target/release/gossip-nodes \
+--node-count 3 --rate 100 --time-limit 20 --nemesis partition
+```
