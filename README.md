@@ -20,53 +20,19 @@ Then download a Maelstrom release tarball and extract it somewhere convenient.
 ## Build
 
 ```sh
+git clone https://github.com/gorgemul/gossip-nodes.git
+cd gossip-nodes
 cargo build --release
-```
-
-Binary lands at `target/release/gossip-nodes`.
-
-## Run
-
-Run it by hand by piping JSON lines into the binary:
-
-```sh
-echo '{"src":"c1","dest":"n1","body":{"type":"init","msg_id":1,"node_id":"n1","node_ids":["n1"]}}' \
-  | cargo run
 ```
 
 ## Test
 
-Echo workload:
-
 ```sh
-./maelstrom test -w echo --bin /path/to/gossip-nodes/target/release/gossip-nodes \
-  --node-count 1 --time-limit 10
-```
+# NOTE: Configure test_tool_dir and program_dir in the test.sh to real path, otherwise ./test.sh will throw errors like: "{test_tool_dir|program_dir} variable should be configured to real {maelstrom|program} directory"
+# test_tool_dir="/my/own/maelstrom/dir"
+# program_dir="/my/own/gossip-nodes/dir"
+mv ./test.sh.example ./test.sh
 
-Unique id generation workload:
-
-```sh
-./maelstrom test -w unique-ids --bin /path/to/gossip-nodes/target/release/gossip-nodes \
---time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
-```
-
-Single node broadcast workload:
-
-```sh
-./maelstrom test -w broadcast --bin /path/to/gossip-nodes/target/release/gossip-nodes \ 
---node-count 1 --time-limit 20 --rate 10
-```
-
-Multiple nodes broadcast workload:
-
-```sh
-./maelstrom test -w broadcast --bin /path/to/gossip-nodes/target/release/gossip-nodes \ 
---node-count 5 --time-limit 20 --rate 10
-```
-
-Grow only counter workload
-
-```sh
-WORKLOAD=counter ./maelstrom test -w g-counter --bin /path/to/gossip-nodes/target/release/gossip-nodes \
---node-count 3 --rate 100 --time-limit 20 --nemesis partition
+# test {echo|unique-ids|single-node-broadcast|multi-nodes-broadcast|g-counter} workload
+./test.sh
 ```

@@ -1,0 +1,93 @@
+#!/bin/bash
+
+exec 2> /dev/null
+
+TEMPLATE_TEST_TOOL_DIR="/path/to/your/maelstorm/dir"
+TEMPLATE_PROGRAM_DIR="/path/to/your/gossip-nodes/dir"
+
+# NOTE: these two need to be config
+test_tool_dir="$TEMPLATE_TEST_TOOL_DIR"
+program_dir="$TEMPLATE_PROGRAM_DIR"
+
+test_bin_path="$test_tool_dir/maelstrom"
+program_bin_path="$program_dir/target/release/gossip-nodes"
+output_dir="$test_tool_dir/tmp"
+echo_test_output_path="$output_dir/echo.txt"
+generate_test_output_path="$output_dir/generate.txt"
+single_node_brocast_test_output_path="$output_dir/single_node_brocast.txt"
+multiple_nodes_brocast_test_output_path="$output_dir/multiple_nodes_brocast.txt"
+grow_only_test_output_path="$output_dir/grow_only_counter.txt"
+
+total_test_counts="0"
+success_test_counts="0"
+fail_test_counts="0"
+success_message="Everything looks good!"
+
+# Jepsen writes its store relative to the working directory, so concurrent runs
+# race on the store/current symlink and one of them crashes. Give every run its
+# own working directory.
+function run_test() {
+  local output_file=$1
+  shift
+  local workdir="$output_dir/$total_test_counts"
+  mkdir -p "$workdir"
+  (cd "$workdir" && "$@") > "$output_file" &
+  ((total_test_counts++))
+}
+
+function assert_success() {
+  local output_file=$1
+  local test_suite_name
+  test_suite_name=$(basename "$output_file" .txt)
+  if grep -qF "$success_message" "$output_file"; then
+    echo "[SUCCESS] $test_suite_name"
+    ((success_test_counts++))
+  else
+    echo "[FAIL] $test_suite_name"
+    ((fail_test_counts++))
+  fi
+}
+
+echo "[INFO] Check if test_tool_dir and program_dir being configured"
+
+if [[ "$test_tool_dir" == "$TEMPLATE_TEST_TOOL_DIR"  ]]; then
+  echo "test_tool_dir variable should be configured to real maelstrom directory"
+  exit 1
+fi
+
+if [[ "$program_dir" == "$TEMPLATE_PROGRAM_DIR" ]]; then
+  echo "program_dir variable should be configured to real program directory"
+  exit 1
+fi
+
+echo "[INFO] Build binary: cargo build --release --manifest-path $program_dir/Cargo.toml"
+cargo build --release --manifest-path "$program_dir/Cargo.toml"
+
+echo "[INFO] Run echo test"
+run_test "$echo_test_output_path" "$test_bin_path" test -w echo --bin "$program_bin_path" --node-count 1 --time-limit 10
+
+echo "[INFO] Run generate test"
+run_test "$generate_test_output_path" "$test_bin_path" test -w unique-ids --bin "$program_bin_path" --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
+
+echo "[INFO] Run single node broadcast test"
+run_test "$single_node_brocast_test_output_path" "$test_bin_path" test -w broadcast --bin "$program_bin_path" --node-count 1 --time-limit 20 --rate 10
+
+echo "[INFO] Run multiple nodes broadcast test"
+run_test "$multiple_nodes_brocast_test_output_path" "$test_bin_path" test -w broadcast --bin "$program_bin_path" --node-count 5 --time-limit 20 --rate 10
+
+echo "[INFO] Run grow only counter test"
+run_test "$grow_only_test_output_path" env WORKLOAD=counter "$test_bin_path" test -w g-counter --bin "$program_bin_path" --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+
+echo "[INFO] Wait all tests to finish"
+wait
+
+assert_success "$echo_test_output_path"
+assert_success "$generate_test_output_path"
+assert_success "$single_node_brocast_test_output_path"
+assert_success "$multiple_nodes_brocast_test_output_path"
+assert_success "$grow_only_test_output_path"
+
+echo "[INFO] Total: $total_test_counts, success: $success_test_counts, fail: $fail_test_counts"
+
+echo "[INFO] Clean output directory: $output_dir"
+rm -r "$output_dir"
