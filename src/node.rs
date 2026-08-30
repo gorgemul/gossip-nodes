@@ -1,4 +1,4 @@
-use crate::kv::{seq_kv_compare_and_swap_u64, seq_kv_read_u64, seq_kv_read_u64_fresh};
+use crate::kv;
 use crate::message::{Message, MessageType};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -130,7 +130,7 @@ impl Node {
                 // https://fly.io/dist-sys/4/  -> {"type":"read_ok","value":123}
                 G_COUNTER_WORKLOAD => {
                     let value = loop {
-                        match seq_kv_read_u64_fresh(&node) {
+                        match kv::seq_kv_read_u64_fresh(&node) {
                             Ok(value) => break value,
                             Err(err) => eprintln!("retry: {}", err),
                         }
@@ -156,8 +156,8 @@ impl Node {
         handlers.insert(MessageType::Add, |node, request| {
             let delta = request.get_body_value("delta", Value::as_u64)?;
             loop {
-                let value = seq_kv_read_u64(&node).unwrap_or(0);
-                match seq_kv_compare_and_swap_u64(&node, value, value + delta) {
+                let value = kv::seq_kv_read_u64(&node).unwrap_or(0);
+                match kv::seq_kv_compare_and_swap_u64(&node, value, value + delta) {
                     Ok(()) => break,
                     Err(err) => eprintln!("retry: {}", err),
                 }
@@ -179,9 +179,6 @@ impl Node {
     }
     fn is_init(&self) -> bool {
         !self.shared.read().unwrap().id.is_empty()
-    }
-    pub fn id(&self) -> String {
-        self.shared.read().unwrap().id.clone()
     }
     fn get_next_msg_id(&self) -> u64 {
         let mut state = self

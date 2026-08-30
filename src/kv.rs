@@ -33,10 +33,11 @@ pub fn seq_kv_write_u64(node: &Arc<Node>, key: &str, value: u64) -> Result<()> {
 // seq-kv only guarantees sequential consistency: a request that does not change
 // the store may be served from any state at or after the one this node last
 // observed, so a plain read can return a counter that misses other nodes'
-// already-acknowledged `add`s.
+// already-acknowledged `add`s. key content don't matter for barrier.
+// But must be a write (state-changing op), because barrier come from write ordering,
+// not from key identity. For better debugging can have a key with node_id
 pub fn seq_kv_read_u64_fresh(node: &Arc<Node>) -> Result<u64> {
-    let key = format!("sync_{}", node.id());
-    seq_kv_write_u64(node, &key, SEQ_KV_COUNTER.fetch_add(1, Ordering::SeqCst))?;
+    seq_kv_write_u64(node, "sync", SEQ_KV_COUNTER.fetch_add(1, Ordering::SeqCst))?;
     seq_kv_read_u64(node)
 }
 
