@@ -76,7 +76,7 @@ echo "[INFO] Run multiple nodes broadcast test"
 run_test "$multiple_nodes_brocast_test_output_path" "$test_bin_path" test -w broadcast --bin "$program_bin_path" --node-count 5 --time-limit 20 --rate 10
 
 echo "[INFO] Run grow only counter test"
-run_test "$grow_only_test_output_path" env WORKLOAD=counter "$test_bin_path" test -w g-counter --bin "$program_bin_path" --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+run_test "$grow_only_test_output_path" env WORKLOAD=g-counter "$test_bin_path" test -w g-counter --bin "$program_bin_path" --node-count 3 --rate 100 --time-limit 20 --nemesis partition
 
 echo "[INFO] Wait all tests to finish"
 wait

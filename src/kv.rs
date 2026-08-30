@@ -1,11 +1,14 @@
-use crate::Node;
+use crate::node::Node;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const SEQ_KV: &str = "seq-kv";
-pub const GLOBAL_COUNTER_KEY: &str = "global_counter_key";
+static SEQ_KV_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const SEQ_KV: &str = "seq-kv";
+const GLOBAL_COUNTER_KEY: &str = "g-counter-key";
 
 pub fn seq_kv_read_u64(node: &Arc<Node>) -> Result<u64> {
     let mut body: HashMap<String, Value> = HashMap::new();
@@ -32,8 +35,8 @@ pub fn seq_kv_write_u64(node: &Arc<Node>, key: &str, value: u64) -> Result<()> {
 // observed, so a plain read can return a counter that misses other nodes'
 // already-acknowledged `add`s.
 pub fn seq_kv_read_u64_fresh(node: &Arc<Node>) -> Result<u64> {
-    let key = format!("sync_{}", node.id.read().unwrap());
-    seq_kv_write_u64(node, &key, node.get_next_msg_id())?;
+    let key = format!("sync_{}", node.id());
+    seq_kv_write_u64(node, &key, SEQ_KV_COUNTER.fetch_add(1, Ordering::SeqCst))?;
     seq_kv_read_u64(node)
 }
 
