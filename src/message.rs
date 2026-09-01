@@ -29,6 +29,10 @@ pub enum MessageType {
     Broadcast,
     Read,
     Add,
+    Send,
+    Poll,
+    CommitOffsets,
+    ListCommittedOffsets,
     #[serde(untagged)]
     Default(String),
 }
@@ -41,7 +45,7 @@ enum RpcCode {
 // TODO: maybe have a new from reading the line
 impl Message {
     pub fn from_stdin(message: &str) -> Result<Self> {
-        serde_json::from_str(&message)
+        serde_json::from_str(message)
             .context(format!("request is not valid json format: {}", message))
     }
     pub fn get_body_value<'a, T>(
@@ -99,6 +103,10 @@ impl std::fmt::Display for MessageType {
             MessageType::Broadcast => "broadcast",
             MessageType::Read => "read",
             MessageType::Add => "add",
+            MessageType::Send => "send",
+            MessageType::Poll => "poll",
+            MessageType::CommitOffsets => "commit_offsets",
+            MessageType::ListCommittedOffsets => "list_committed_offsets",
             MessageType::Default(s) => s,
         };
         write!(f, "{}", s)

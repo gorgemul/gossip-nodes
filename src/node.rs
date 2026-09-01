@@ -1,6 +1,7 @@
 use crate::kv;
+use crate::log::Log;
 use crate::message::{Message, MessageType};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -34,12 +35,13 @@ struct NodeSharedState {
 
 #[derive(Debug)]
 pub struct Node {
+    log: Log,
     shared: RwLock<NodeSharedState>,
     exclusive: Mutex<NodeExclusiveState>,
 }
 
 impl Node {
-    pub fn new() -> Result<Self> {
+    pub fn new(log: Log) -> Result<Self> {
         let mut handlers: HashMap<MessageType, Handler> = HashMap::new();
         // register init handler
         handlers.insert(MessageType::Init, |node, request| {
@@ -63,30 +65,33 @@ impl Node {
                     }
                 }
             }
-            node.reply(request, HashMap::new())?;
+            node.reply(&request, HashMap::new())?;
             Ok(())
         });
         // register echo handler
         handlers.insert(MessageType::Echo, |node, request| {
             let body = request.body.extra.clone();
-            node.reply(request, body)?;
+            node.reply(&request, body)?;
             Ok(())
         });
         // register generate handler
         handlers.insert(MessageType::Generate, |node, request| {
             let mut body = HashMap::new();
-            let msg_id = node.get_next_msg_id();
             body.insert(
                 String::from("id"),
-                json!(format!("{}#{}", node.shared.read().unwrap().id, msg_id)),
+                json!(format!(
+                    "{}#{}",
+                    node.shared.read().unwrap().id,
+                    node.msg_id()
+                )),
             );
-            node.reply(request, body)?;
+            node.reply(&request, body)?;
             Ok(())
         });
         // register topology handler
         // NOTE: only reply ok to the request, we get the neighbor info when init the node
         handlers.insert(MessageType::Topology, |node, request| {
-            node.reply(request, HashMap::new())?;
+            node.reply(&request, HashMap::new())?;
             Ok(())
         });
         // register broadcast handler
@@ -99,7 +104,7 @@ impl Node {
                     .expect("Fail to get lock in broadcast handler")
                     .messages;
                 if messages.contains(message) {
-                    node.reply(request, HashMap::new())?;
+                    node.reply(&request, HashMap::new())?;
                     return Ok(());
                 }
                 messages.push(message.to_owned());
@@ -116,7 +121,7 @@ impl Node {
                 body.insert(String::from("message"), message.to_owned());
                 node.rpc(neighbor, body, None)?;
             }
-            node.reply(request, HashMap::new())?;
+            node.reply(&request, HashMap::new())?;
             Ok(())
         });
         // NOTE: the broadcast workload rejects a 'value' key and the g-counter workload rejects
@@ -149,7 +154,7 @@ impl Node {
                     body.insert(String::from("messages"), json!(messages));
                 }
             }
-            node.reply(request, body)?;
+            node.reply(&request, body)?;
             Ok(())
         });
         // register add handler
@@ -162,7 +167,58 @@ impl Node {
                     Err(err) => eprintln!("retry: {}", err),
                 }
             }
-            node.reply(request, HashMap::new())?;
+            node.reply(&request, HashMap::new())?;
+            Ok(())
+        });
+        // register send handler
+        handlers.insert(MessageType::Send, |node, request| {
+            let offset = node.log.append(
+                request.get_body_value("key", Value::as_str)?,
+                request.get_body_value_raw("msg")?,
+            );
+            let mut body: HashMap<String, Value> = HashMap::new();
+            body.insert(String::from("offset"), json!(offset));
+            node.reply(&request, body)?;
+            Ok(())
+        });
+        // register poll handler
+        handlers.insert(MessageType::Poll, |node, request| {
+            let key_to_offset = request.get_body_value("offsets", Value::as_object)?;
+            let key_to_offset = key_to_offset
+                .into_iter()
+                .map(|(k, v)| Some((k.as_str(), v.as_u64()?)))
+                .collect::<Option<HashMap<_, _>>>()
+                .ok_or_else(|| anyhow!("Some offset value was not a u64"))?;
+            let messages = node.log.read(&key_to_offset);
+            let mut body: HashMap<String, Value> = HashMap::new();
+            body.insert(String::from("msgs"), json!(messages));
+            node.reply(&request, body)?;
+            Ok(())
+        });
+        // register commit offsets handler
+        handlers.insert(MessageType::CommitOffsets, |node, request| {
+            let key_to_offset = request.get_body_value("offsets", Value::as_object)?;
+            let key_to_offset = key_to_offset
+                .into_iter()
+                .map(|(k, v)| Some((k.as_str(), v.as_u64()?)))
+                .collect::<Option<HashMap<_, _>>>()
+                .ok_or_else(|| anyhow!("Some offset value was not a u64"))?;
+            node.log.commit(key_to_offset);
+            node.reply(&request, HashMap::new())?;
+            Ok(())
+        });
+        // register list committed offsets
+        handlers.insert(MessageType::ListCommittedOffsets, |node, request| {
+            let keys = request.get_body_value("keys", Value::as_array)?;
+            let keys = keys
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| anyhow!("Some key value was not a string"))?;
+            let key_to_offset = node.log.read_committed(&keys);
+            let mut body: HashMap<String, Value> = HashMap::new();
+            body.insert(String::from("offsets"), json!(key_to_offset));
+            node.reply(&request, body)?;
             Ok(())
         });
         let shared = RwLock::new(NodeSharedState {
@@ -175,18 +231,20 @@ impl Node {
             msg_id: 0,
             messages: vec![],
         });
-        Ok(Self { shared, exclusive })
+        Ok(Self {
+            log,
+            shared,
+            exclusive,
+        })
     }
     fn is_init(&self) -> bool {
         !self.shared.read().unwrap().id.is_empty()
     }
-    fn get_next_msg_id(&self) -> u64 {
-        let mut state = self
-            .exclusive
-            .lock()
-            .expect("Fail to get lock in get_next_msg_id");
+    fn msg_id(&self) -> u64 {
+        let mut state = self.exclusive.lock().expect("Fail to get lock in msg_id");
+        let msg_id = state.msg_id;
         state.msg_id += 1;
-        state.msg_id
+        msg_id
     }
     fn rpc(
         &self,
@@ -194,7 +252,7 @@ impl Node {
         mut body: HashMap<String, Value>,
         callback: Option<Callback>,
     ) -> Result<()> {
-        let msg_id = self.get_next_msg_id();
+        let msg_id = self.msg_id();
         body.insert(String::from("msg_id"), json!(msg_id));
         if let Some(callback) = callback {
             self.exclusive
@@ -223,7 +281,7 @@ impl Node {
         }
         Ok(message)
     }
-    fn reply(&self, request: Message, mut body: HashMap<String, Value>) -> Result<()> {
+    fn reply(&self, request: &Message, mut body: HashMap<String, Value>) -> Result<()> {
         let msg_id = request.get_body_value("msg_id", Value::as_u64)?;
         let response_type = format!("{}_ok", request.body.kind);
         body.entry(String::from("in_reply_to"))
