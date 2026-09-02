@@ -1,54 +1,67 @@
 use crate::node::Node;
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static SEQ_KV_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-const SEQ_KV: &str = "seq-kv";
-const GLOBAL_COUNTER_KEY: &str = "g-counter-key";
-
-pub fn seq_kv_read_u64(node: &Arc<Node>) -> Result<u64> {
-    let mut body: HashMap<String, Value> = HashMap::new();
-    body.insert(String::from("type"), json!("read"));
-    body.insert(String::from("key"), json!(GLOBAL_COUNTER_KEY));
-    let message = node
-        .rpc_sync(SEQ_KV, body)
-        .context("seq_kv_read_u64 fail:")?;
-    message.get_body_value("value", Value::as_u64)
+#[derive(Debug)]
+enum KVType {
+    Seq,
 }
 
-pub fn seq_kv_write_u64(node: &Arc<Node>, key: &str, value: u64) -> Result<()> {
-    let mut body: HashMap<String, Value> = HashMap::new();
-    body.insert(String::from("type"), json!("write"));
-    body.insert(String::from("key"), json!(key));
-    body.insert(String::from("value"), json!(value));
-    node.rpc_sync(SEQ_KV, body)
-        .context("seq_kv_write_u64 fail:")?;
-    Ok(())
+#[derive(Debug)]
+pub struct KV<'a> {
+    kind: KVType,
+    node: &'a Arc<Node>,
 }
 
-// seq-kv only guarantees sequential consistency: a request that does not change
-// the store may be served from any state at or after the one this node last
-// observed, so a plain read can return a counter that misses other nodes'
-// already-acknowledged `add`s. key content don't matter for barrier.
-// But must be a write (state-changing op), because barrier come from write ordering,
-// not from key identity. For better debugging can have a key with node_id
-pub fn seq_kv_read_u64_fresh(node: &Arc<Node>) -> Result<u64> {
-    seq_kv_write_u64(node, "sync", SEQ_KV_COUNTER.fetch_add(1, Ordering::SeqCst))?;
-    seq_kv_read_u64(node)
+impl<'a> KV<'a> {
+    pub fn new_seq(node: &'a Arc<Node>) -> Self {
+        Self {
+            kind: KVType::Seq,
+            node,
+        }
+    }
+    pub fn read(&self, key: &str) -> Result<Value> {
+        let mut body: HashMap<String, Value> = HashMap::new();
+        body.insert(String::from("type"), json!("read"));
+        body.insert(String::from("key"), json!(key));
+        let message = self
+            .node
+            .rpc_sync(&self.kind.to_string(), body)
+            .context(format!("{} KV read fail:", self.kind))?;
+        Ok(message.get_body_value_raw("value")?.to_owned())
+    }
+    pub fn write<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+        let mut body: HashMap<String, Value> = HashMap::new();
+        body.insert(String::from("type"), json!("write"));
+        body.insert(String::from("key"), json!(key));
+        body.insert(String::from("value"), json!(value));
+        self.node
+            .rpc_sync(&self.kind.to_string(), body)
+            .context(format!("{} KV write fail:", self.kind))?;
+        Ok(())
+    }
+    pub fn compare_and_swap<T: Serialize>(&self, key: &str, from: T, to: T) -> Result<()> {
+        let mut body: HashMap<String, Value> = HashMap::new();
+        body.insert(String::from("type"), json!("cas"));
+        body.insert(String::from("key"), json!(key));
+        body.insert(String::from("from"), json!(from));
+        body.insert(String::from("to"), json!(to));
+        body.insert(String::from("create_if_not_exists"), json!(true));
+        self.node
+            .rpc_sync(&self.kind.to_string(), body)
+            .context(format!("{} KV compare_and_swap fail:", self.kind))?;
+        Ok(())
+    }
 }
 
-pub fn seq_kv_compare_and_swap_u64(node: &Arc<Node>, from: u64, to: u64) -> Result<()> {
-    let mut body: HashMap<String, Value> = HashMap::new();
-    body.insert(String::from("type"), json!("cas"));
-    body.insert(String::from("key"), json!(GLOBAL_COUNTER_KEY));
-    body.insert(String::from("from"), json!(from));
-    body.insert(String::from("to"), json!(to));
-    body.insert(String::from("create_if_not_exists"), json!(true));
-    node.rpc_sync(SEQ_KV, body)
-        .context("seq_kv_compare_and_swap fail:")?;
-    Ok(())
+impl std::fmt::Display for KVType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            KVType::Seq => "seq-kv",
+        };
+        write!(f, "{}", s)
+    }
 }

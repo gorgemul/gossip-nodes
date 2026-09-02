@@ -1,4 +1,4 @@
-use crate::kv;
+use crate::kv::KV;
 use crate::log::Log;
 use crate::message::{Message, MessageType};
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,6 +9,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 use std::{env, fmt, thread};
 
+const GLOBAL_COUNTER_KEY: &str = "g-counter-key";
 const G_COUNTER_WORKLOAD: &str = "g-counter";
 const BROADCAST_WORKLOAD: &str = "broadcast";
 static WORKLOAD: OnceLock<String> = OnceLock::new();
@@ -134,9 +135,20 @@ impl Node {
             match workload.deref() {
                 // https://fly.io/dist-sys/4/  -> {"type":"read_ok","value":123}
                 G_COUNTER_WORKLOAD => {
+                    let seq_kv = KV::new_seq(&node);
+                    let sync_key = format!("sync-{}", node.shared.read().unwrap().id);
                     let value = loop {
-                        match kv::seq_kv_read_u64_fresh(&node) {
-                            Ok(value) => break value,
+                        // seq-kv only guarantees sequential consistency: a request that does not change
+                        // the store may be served from any state at or after the one this node last
+                        // observed, so a plain read can return a counter that misses other nodes'
+                        // already-acknowledged `add`s.
+                        // The barrier is not "send a write", it is "actually change the store
+                        if let Err(err) = seq_kv.write(&sync_key, node.msg_id()) {
+                            eprintln!("retry: {}", err);
+                            continue;
+                        }
+                        match seq_kv.read(GLOBAL_COUNTER_KEY) {
+                            Ok(value) => break value.as_u64().unwrap_or(0),
                             Err(err) => eprintln!("retry: {}", err),
                         }
                     };
@@ -160,9 +172,14 @@ impl Node {
         // register add handler
         handlers.insert(MessageType::Add, |node, request| {
             let delta = request.get_body_value("delta", Value::as_u64)?;
+            let seq_kv = KV::new_seq(&node);
             loop {
-                let value = kv::seq_kv_read_u64(&node).unwrap_or(0);
-                match kv::seq_kv_compare_and_swap_u64(&node, value, value + delta) {
+                let value = seq_kv
+                    .read(GLOBAL_COUNTER_KEY)
+                    .ok()
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                match seq_kv.compare_and_swap(GLOBAL_COUNTER_KEY, value, value + delta) {
                     Ok(()) => break,
                     Err(err) => eprintln!("retry: {}", err),
                 }
