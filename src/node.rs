@@ -1,5 +1,5 @@
 use crate::kv::KV;
-use crate::log::Log;
+use crate::log;
 use crate::message::{Message, MessageType};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -36,13 +36,12 @@ struct NodeSharedState {
 
 #[derive(Debug)]
 pub struct Node {
-    log: Log,
     shared: RwLock<NodeSharedState>,
     exclusive: Mutex<NodeExclusiveState>,
 }
 
 impl Node {
-    pub fn new(log: Log) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let mut handlers: HashMap<MessageType, Handler> = HashMap::new();
         // register init handler
         handlers.insert(MessageType::Init, |node, request| {
@@ -189,10 +188,11 @@ impl Node {
         });
         // register send handler
         handlers.insert(MessageType::Send, |node, request| {
-            let offset = node.log.append(
+            let log = log::Log::new(KV::new_lin(&node));
+            let offset = log.append(
                 request.get_body_value("key", Value::as_str)?,
                 request.get_body_value_raw("msg")?,
-            );
+            )?;
             let mut body: HashMap<String, Value> = HashMap::new();
             body.insert(String::from("offset"), json!(offset));
             node.reply(&request, body)?;
@@ -206,7 +206,8 @@ impl Node {
                 .map(|(k, v)| Some((k.as_str(), v.as_u64()?)))
                 .collect::<Option<HashMap<_, _>>>()
                 .ok_or_else(|| anyhow!("Some offset value was not a u64"))?;
-            let messages = node.log.read(&key_to_offset);
+            let log = log::Log::new(KV::new_lin(&node));
+            let messages = log.read(&key_to_offset)?;
             let mut body: HashMap<String, Value> = HashMap::new();
             body.insert(String::from("msgs"), json!(messages));
             node.reply(&request, body)?;
@@ -220,7 +221,8 @@ impl Node {
                 .map(|(k, v)| Some((k.as_str(), v.as_u64()?)))
                 .collect::<Option<HashMap<_, _>>>()
                 .ok_or_else(|| anyhow!("Some offset value was not a u64"))?;
-            node.log.commit(key_to_offset);
+            let log = log::Log::new(KV::new_lin(&node));
+            log.commit(&key_to_offset)?;
             node.reply(&request, HashMap::new())?;
             Ok(())
         });
@@ -232,7 +234,8 @@ impl Node {
                 .map(|v| v.as_str())
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| anyhow!("Some key value was not a string"))?;
-            let key_to_offset = node.log.read_committed(&keys);
+            let log = log::Log::new(KV::new_lin(&node));
+            let key_to_offset = log.read_committed(&keys)?;
             let mut body: HashMap<String, Value> = HashMap::new();
             body.insert(String::from("offsets"), json!(key_to_offset));
             node.reply(&request, body)?;
@@ -248,11 +251,7 @@ impl Node {
             msg_id: 0,
             messages: vec![],
         });
-        Ok(Self {
-            log,
-            shared,
-            exclusive,
-        })
+        Ok(Self { shared, exclusive })
     }
     fn is_init(&self) -> bool {
         !self.shared.read().unwrap().id.is_empty()

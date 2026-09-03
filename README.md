@@ -33,6 +33,6 @@ cargo build --release
 # program_dir="/my/own/gossip-nodes/dir"
 mv ./test.sh.example ./test.sh
 
-# test {echo|unique-ids|single-node-broadcast|multi-nodes-broadcast|g-counter} workload
+# test {echo|unique-ids|single-node-broadcast|multi-nodes-broadcast|g-counter|kafka} workload
 ./test.sh
 ```

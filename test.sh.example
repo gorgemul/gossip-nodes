@@ -18,6 +18,7 @@ single_node_brocast_test_output_path="$output_dir/single_node_brocast.txt"
 multiple_nodes_brocast_test_output_path="$output_dir/multiple_nodes_brocast.txt"
 grow_only_test_output_path="$output_dir/grow_only_counter.txt"
 single_node_kafka_test_output_path="$output_dir/single_node_kafka.txt"
+multiple_nodes_kafka_test_output_path="$output_dir/multiple_nodes_kafka.txt"
 
 total_test_counts="0"
 success_test_counts="0"
@@ -82,6 +83,9 @@ run_test "$grow_only_test_output_path" env WORKLOAD=g-counter "$test_bin_path" t
 echo "[INFO] Run single node kafka test"
 run_test "$single_node_kafka_test_output_path" env "$test_bin_path" test -w kafka --bin "$program_bin_path" --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
 
+echo "[INFO] Run multiple nodes kafka test"
+run_test "$multiple_nodes_kafka_test_output_path" env "$test_bin_path" test -w kafka --bin "$program_bin_path" --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
+
 echo "[INFO] Wait all tests to finish"
 wait
 
@@ -91,6 +95,7 @@ assert_success "$single_node_brocast_test_output_path"
 assert_success "$multiple_nodes_brocast_test_output_path"
 assert_success "$grow_only_test_output_path"
 assert_success "$single_node_kafka_test_output_path"
+assert_success "$multiple_nodes_kafka_test_output_path"
 
 echo "[INFO] Total: $total_test_counts, success: $success_test_counts, fail: $fail_test_counts"
 

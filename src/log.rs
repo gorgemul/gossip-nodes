@@ -1,56 +1,89 @@
-use serde_json::Value;
+use crate::kv::KV;
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json, map::Entry};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
-#[derive(Debug)]
+const MESSAGES: &str = "messages";
+
+#[derive(Debug, Serialize, Deserialize)]
 struct LogEntry {
     offset: u64,
     value: Value,
     is_committed: bool,
 }
 
-#[derive(Debug)]
-pub struct Log {
-    offset: Mutex<u64>,
-    content: Mutex<HashMap<String, Vec<LogEntry>>>,
+pub struct Log<'a> {
+    kv: KV<'a>,
 }
 
-impl Log {
-    pub fn new() -> Self {
-        Log {
-            offset: Mutex::new(0),
-            content: Mutex::new(HashMap::new()),
-        }
+impl<'a> Log<'a> {
+    pub fn new(kv: KV<'a>) -> Self {
+        Self { kv }
     }
-    fn offset(&self) -> u64 {
-        let mut offset = self.offset.lock().unwrap();
-        let next_offset = *offset;
-        *offset += 1;
-        next_offset
-    }
-    pub fn append(&self, key: &str, value: &Value) -> u64 {
-        let mut content = self.content.lock().unwrap();
-        let offset = self.offset();
-        let new_log_entry = LogEntry {
-            offset,
-            value: value.to_owned(),
-            is_committed: false,
+    pub fn append(&self, key: &str, value: &Value) -> Result<u64> {
+        let offset = loop {
+            let default = serde_json::Map::new();
+            let content = self.kv.read(MESSAGES).ok();
+            let content = content
+                .as_ref()
+                .and_then(|v| v.as_object())
+                .unwrap_or(&default);
+            let mut new_content = content.clone();
+            let mut offset = 0u64;
+            for (_, entries) in new_content.iter() {
+                if let Some(entries) = entries.as_array() {
+                    offset += entries.len() as u64;
+                };
+            }
+            let new_entry = LogEntry {
+                offset,
+                value: value.to_owned(),
+                is_committed: false,
+            };
+            match new_content.entry(key) {
+                Entry::Occupied(mut e) => {
+                    e.get_mut()
+                        .as_array_mut()
+                        .ok_or(anyhow!("Content entries should be array"))?
+                        .push(json!(new_entry));
+                }
+                Entry::Vacant(e) => {
+                    e.insert(json!([new_entry]));
+                }
+            }
+            match self.kv.compare_and_swap(MESSAGES, content, &new_content) {
+                Ok(_) => break offset,
+                Err(err) => eprintln!("retry {}", err),
+            }
         };
-        content
-            .entry(String::from(key))
-            .or_default()
-            .push(new_log_entry);
-        offset
+        Ok(offset)
     }
-    pub fn read(&self, key_to_offset: &HashMap<&str, u64>) -> HashMap<String, Vec<(u64, Value)>> {
-        let content = self.content.lock().unwrap();
+    pub fn read(
+        &self,
+        key_to_offset: &HashMap<&str, u64>,
+    ) -> Result<HashMap<String, Vec<(u64, Value)>>> {
         let mut result: HashMap<String, Vec<(u64, Value)>> = HashMap::new();
+        let content = match self.kv.read(MESSAGES) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!("{}", err);
+                return Ok(result);
+            }
+        };
+        let content = content
+            .as_object()
+            .context(format!("{} value should be an object", MESSAGES))?;
         for (&key, &offset) in key_to_offset {
             let Some(entries) = content.get(key) else {
                 continue;
             };
-            let mut values: Vec<(u64, Value)> = vec![];
-            for entry in entries {
+            let entries = entries
+                .as_array()
+                .context(format!("Key={}'s value should be an array", key))?;
+            let mut values: Vec<(u64, Value)> = Vec::new();
+            for entry_value in entries {
+                let entry: LogEntry = serde_json::from_value(entry_value.to_owned())?;
                 if entry.offset >= offset {
                     values.push((entry.offset, entry.value.clone()));
                 }
@@ -59,35 +92,60 @@ impl Log {
                 result.insert(String::from(key), values);
             }
         }
-        result
+        Ok(result)
     }
-    pub fn commit(&self, key_to_offset: HashMap<&str, u64>) {
-        let mut content = self.content.lock().unwrap();
-        for (&key, &offset) in &key_to_offset {
-            let Some(entries) = content.get_mut(key) else {
-                continue;
-            };
-            for entry in entries {
-                if entry.offset <= offset {
-                    entry.is_committed = true;
+    pub fn commit(&self, key_to_offset: &HashMap<&str, u64>) -> Result<()> {
+        loop {
+            let content = self.kv.read(MESSAGES)?;
+            let mut new_content = content.clone();
+            for (&key, &offset) in key_to_offset {
+                let Some(entries) = new_content.get_mut(key) else {
+                    continue;
+                };
+                let entries = entries
+                    .as_array_mut()
+                    .context(format!("Key={}'s value should be an array", key))?;
+                for entry_value in entries {
+                    let mut entry: LogEntry = serde_json::from_value(entry_value.to_owned())?;
+                    if entry.offset <= offset {
+                        entry.is_committed = true;
+                        *entry_value = json!(entry);
+                    }
                 }
             }
+            match self.kv.compare_and_swap(MESSAGES, &content, &new_content) {
+                Ok(_) => break,
+                Err(err) => eprintln!("retry {}", err),
+            }
         }
+        Ok(())
     }
-    pub fn read_committed(&self, keys: &[&str]) -> HashMap<String, u64> {
-        let content = self.content.lock().unwrap();
+    pub fn read_committed(&self, keys: &[&str]) -> Result<HashMap<String, u64>> {
         let mut result: HashMap<String, u64> = HashMap::new();
+        let content = match self.kv.read(MESSAGES) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!("{}", err);
+                return Ok(result);
+            }
+        };
+        let content = content
+            .as_object()
+            .context(format!("{} value should be an object", MESSAGES))?;
         for &key in keys {
             let Some(entries) = content.get(key) else {
                 continue;
             };
-            for entry in entries.iter().rev() {
+            let entries = entries
+                .as_array()
+                .context(format!("Key={}'s value should be an array", key))?;
+            for entry_value in entries.iter().rev() {
+                let entry: LogEntry = serde_json::from_value(entry_value.to_owned())?;
                 if entry.is_committed {
                     result.insert(String::from(key), entry.offset);
-                    break;
                 }
             }
         }
-        result
+        Ok(result)
     }
 }
