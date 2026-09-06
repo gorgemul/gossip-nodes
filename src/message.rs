@@ -33,6 +33,7 @@ pub enum MessageType {
     Poll,
     CommitOffsets,
     ListCommittedOffsets,
+    Txn,
     #[serde(untagged)]
     Default(String),
 }
@@ -107,6 +108,7 @@ impl std::fmt::Display for MessageType {
             MessageType::Poll => "poll",
             MessageType::CommitOffsets => "commit_offsets",
             MessageType::ListCommittedOffsets => "list_committed_offsets",
+            MessageType::Txn => "txn",
             MessageType::Default(s) => s,
         };
         write!(f, "{}", s)

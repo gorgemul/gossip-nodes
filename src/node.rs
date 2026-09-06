@@ -1,6 +1,6 @@
 use crate::kv::KV;
-use crate::log;
 use crate::message::{Message, MessageType};
+use crate::{log, transaction};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -238,6 +238,52 @@ impl Node {
             let key_to_offset = log.read_committed(&keys)?;
             let mut body: HashMap<String, Value> = HashMap::new();
             body.insert(String::from("offsets"), json!(key_to_offset));
+            node.reply(&request, body)?;
+            Ok(())
+        });
+        // register transaction handler
+        handlers.insert(MessageType::Txn, |node, request| {
+            let operations =
+                request.get_body_value(&MessageType::Txn.to_string(), Value::as_array)?;
+            let mut response_transactions: Vec<(String, u64, Value)> = Vec::new();
+            for operation in operations {
+                let Value::Array(operation) = operation else {
+                    bail!("operation={:?} should be an array", operation);
+                };
+                let kind = match operation.first() {
+                    Some(kind) => match kind.as_str() {
+                        Some(kind) => {
+                            if kind != "r" && kind != "w" {
+                                bail!("kind={:?} can only be 'w' and 'r' right now", kind);
+                            }
+                            kind
+                        }
+                        None => bail!("kind={:?} is not a string type", kind),
+                    },
+                    None => bail!("operation={:?} type is missing", operation),
+                };
+                let key = match operation.get(1) {
+                    Some(key) => match key.as_u64() {
+                        Some(key) => key,
+                        None => bail!("key={:?} is not a number type", key),
+                    },
+                    None => bail!("operation={:?} key is missing", operation),
+                };
+                let value = match operation.get(2) {
+                    Some(key) => key,
+                    None => bail!("operation={:?} value is missing", operation),
+                };
+                let transaction = transaction::Transaction::new(KV::new_lin(&node));
+                if kind == "r" {
+                    let read_value = transaction.read(key);
+                    response_transactions.push((String::from("r"), key, read_value));
+                } else if kind == "w" {
+                    transaction.write(key, value)?;
+                    response_transactions.push((String::from("w"), key, value.to_owned()));
+                }
+            }
+            let mut body: HashMap<String, Value> = HashMap::new();
+            body.insert(String::from("txn"), json!(response_transactions));
             node.reply(&request, body)?;
             Ok(())
         });

@@ -26,7 +26,6 @@ impl<'a> Log<'a> {
     pub fn new(kv: KV<'a>) -> Self {
         Self { kv }
     }
-
     pub fn append(&self, key: &str, value: &Value) -> Result<u64> {
         loop {
             let offset_key = get_offset_key(key);

@@ -2,6 +2,7 @@ mod kv;
 mod log;
 mod message;
 mod node;
+mod transaction;
 use std::sync::Arc;
 
 fn main() {
