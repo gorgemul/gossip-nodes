@@ -20,6 +20,8 @@ grow_only_test_output_path="$output_dir/grow_only_counter.txt"
 single_node_kafka_test_output_path="$output_dir/single_node_kafka.txt"
 multiple_nodes_kafka_test_output_path="$output_dir/multiple_nodes_kafka.txt"
 single_node_transaction_test_output_path="$output_dir/single_node_transaction.txt"
+multiple_nodes_transaction_test_output_path="$output_dir/multiple_nodes_transaction.txt"
+multiple_nodes_transaction_network_partition_test_output_path="$output_dir/multiple_nodes_transaction_network_partition.txt"
 
 total_test_counts="0"
 success_test_counts="0"
@@ -90,6 +92,12 @@ run_test "$multiple_nodes_kafka_test_output_path" env "$test_bin_path" test -w k
 echo "[INFO] Run single node transaction test"
 run_test "$single_node_transaction_test_output_path" env "$test_bin_path" test -w txn-rw-register --bin "$program_bin_path" --node-count 1 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total
 
+echo "[INFO] Run multiple nodes transaction test"
+run_test "$multiple_nodes_transaction_test_output_path" env "$test_bin_path" test -w txn-rw-register --bin "$program_bin_path" --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-uncommitted
+
+echo "[INFO] Run multiple nodes transaction with network partition test"
+run_test "$multiple_nodes_transaction_network_partition_test_output_path" env "$test_bin_path" test -w txn-rw-register --bin "$program_bin_path" --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-uncommitted --availability total --nemesis partition
+
 echo "[INFO] Wait all tests to finish"
 wait
 
@@ -101,6 +109,8 @@ assert_success "$grow_only_test_output_path"
 assert_success "$single_node_kafka_test_output_path"
 assert_success "$multiple_nodes_kafka_test_output_path"
 assert_success "$single_node_transaction_test_output_path"
+assert_success "$multiple_nodes_transaction_test_output_path"
+assert_success "$multiple_nodes_transaction_network_partition_test_output_path"
 
 echo "[INFO] Total: $total_test_counts, success: $success_test_counts, fail: $fail_test_counts"
 
