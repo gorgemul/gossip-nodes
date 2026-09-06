@@ -9,5 +9,4 @@ fn main() {
     if let Err(err) = node.run() {
         eprintln!("Node running error: {:?}", err);
     }
-    std::thread::sleep(std::time::Duration::from_millis(5000));
 }

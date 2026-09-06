@@ -1,14 +1,11 @@
 use crate::kv::KV;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-const CONTENT: &str = "content";
-
 #[derive(Debug, Serialize, Deserialize)]
 struct LogEntry {
-    offset: u64,
     value: Value,
     is_committed: bool,
 }
@@ -17,130 +14,110 @@ pub struct Log<'a> {
     kv: KV<'a>,
 }
 
+fn get_offset_key(key: &str) -> String {
+    format!("offset-{key}")
+}
+
+fn get_entry_key(key: &str, offset: u64) -> String {
+    format!("entries-{key}-{offset}")
+}
+
 impl<'a> Log<'a> {
     pub fn new(kv: KV<'a>) -> Self {
         Self { kv }
     }
+
     pub fn append(&self, key: &str, value: &Value) -> Result<u64> {
         loop {
-            let content = self.kv.read(CONTENT).unwrap_or(json!({}));
-            let offset: u64 = content
-                .as_object()
-                .unwrap_or(&serde_json::Map::new())
-                .values()
-                .filter_map(Value::as_array)
-                .map(|entries| entries.len() as u64)
-                .sum();
-            let mut new_content = content.clone();
-            // NOTE: Both unwrap is fine here since all are set default value
-            new_content
-                .as_object_mut()
-                .unwrap()
-                .entry(key)
-                .or_insert_with(|| json!([]))
-                .as_array_mut()
-                .unwrap()
-                .push(json!(LogEntry {
-                    offset,
-                    value: value.to_owned(),
-                    is_committed: false,
-                }));
-            let Err(err) = self.kv.compare_and_swap(CONTENT, &content, &new_content) else {
-                return Ok(offset);
+            let offset_key = get_offset_key(key);
+            let offset = self
+                .kv
+                .read(&offset_key)
+                .unwrap_or(json!(0))
+                .as_u64()
+                .unwrap();
+            let claimed_offset = match self.kv.compare_and_swap(&offset_key, offset, offset + 1) {
+                Ok(_) => offset,
+                Err(err) => {
+                    eprintln!("Log append retry: {}", err);
+                    continue;
+                }
             };
-            eprintln!("Log append retry: {}", err);
+            self.kv
+                .write(
+                    &get_entry_key(key, claimed_offset),
+                    LogEntry {
+                        is_committed: false,
+                        value: value.to_owned(),
+                    },
+                )
+                .unwrap_or_else(|_| {
+                    panic!("Fatal error: offset={offset_key} is claimed but fail to write content")
+                });
+            return Ok(claimed_offset);
         }
     }
     pub fn read(
         &self,
         key_to_offset: &HashMap<&str, u64>,
     ) -> Result<HashMap<String, Vec<(u64, Value)>>> {
-        let content = match self.kv.read(CONTENT) {
-            Ok(content) => content,
-            Err(err) => {
-                eprintln!("{}", err);
-                return Ok(HashMap::new());
-            }
-        };
-        let Value::Object(mut content) = content else {
-            bail!("{} value should be an object", CONTENT);
-        };
         let mut result: HashMap<String, Vec<(u64, Value)>> = HashMap::new();
         for (&key, &offset) in key_to_offset {
-            let Some(entries) = content.remove(key) else {
-                continue;
-            };
-            let Value::Array(entries) = entries else {
-                bail!("Key={} value should be an array", key);
-            };
-            let mut values: Vec<(u64, Value)> = Vec::new();
-            for entry_value in entries {
-                let entry: LogEntry = serde_json::from_value(entry_value)?;
-                if entry.offset >= offset {
-                    values.push((entry.offset, entry.value));
-                }
+            let mut i = offset;
+            let mut entries: Vec<(u64, Value)> = Vec::new();
+            loop {
+                let Ok(entry) = self.kv.read(&get_entry_key(key, i)) else {
+                    break;
+                };
+                let entry: LogEntry = serde_json::from_value(entry)?;
+                entries.push((i, entry.value));
+                i += 1;
             }
-            if !values.is_empty() {
-                result.insert(String::from(key), values);
+            if !entries.is_empty() {
+                result.insert(key.to_owned(), entries);
             }
         }
         Ok(result)
     }
     pub fn commit(&self, key_to_offset: &HashMap<&str, u64>) -> Result<()> {
-        loop {
-            let content = self.kv.read(CONTENT)?;
-            let Value::Object(mut new_content) = content.clone() else {
-                bail!("{CONTENT} value should be an object");
-            };
-            for (&key, &offset) in key_to_offset {
-                let Some(entries) = new_content.get_mut(key) else {
-                    continue;
+        for (&key, &offset) in key_to_offset {
+            for i in 0..offset + 1 {
+                let entry_key = get_entry_key(key, i);
+                let Ok(entry) = self.kv.read(&entry_key) else {
+                    break;
                 };
-                let Value::Array(entries) = entries else {
-                    bail!("Key={} value should be an array", key);
-                };
-                for entry_value in entries {
-                    let mut entry: LogEntry = serde_json::from_value(entry_value.to_owned())?;
-                    if entry.offset <= offset {
-                        entry.is_committed = true;
-                        *entry_value = json!(entry);
-                    }
+                let mut entry: LogEntry = serde_json::from_value(entry)?;
+                if !entry.is_committed {
+                    entry.is_committed = true;
+                    self.kv.write(&entry_key, entry).unwrap_or_else(|_| {
+                        panic!(
+                            "Fatal error: entry_key={entry_key} is read but fail to write content"
+                        )
+                    });
                 }
-            }
-            match self
-                .kv
-                .compare_and_swap(CONTENT, &content, &json!(new_content))
-            {
-                Ok(_) => break,
-                Err(err) => eprintln!("retry {}", err),
             }
         }
         Ok(())
     }
     pub fn read_committed(&self, keys: &[&str]) -> Result<HashMap<String, u64>> {
-        let content = match self.kv.read(CONTENT) {
-            Ok(content) => content,
-            Err(err) => {
-                eprintln!("{}", err);
-                return Ok(HashMap::new());
-            }
-        };
-        let Value::Object(mut content) = content else {
-            bail!("{} value should be an object", CONTENT);
-        };
         let mut result: HashMap<String, u64> = HashMap::new();
         for &key in keys {
-            let Some(entries) = content.remove(key) else {
-                continue;
-            };
-            let Value::Array(entries) = entries else {
-                bail!("Key={} value should be an array", key);
-            };
-            for entry_value in entries.into_iter().rev() {
-                let entry: LogEntry = serde_json::from_value(entry_value)?;
-                if entry.is_committed {
-                    result.insert(String::from(key), entry.offset);
+            let mut last_committed_offset: Option<u64> = None;
+            let mut offset = 0u64;
+            loop {
+                let entry_key = get_entry_key(key, offset);
+                let Ok(entry) = self.kv.read(&entry_key) else {
+                    break;
+                };
+                let entry: LogEntry = serde_json::from_value(entry)?;
+                if !entry.is_committed {
+                    break;
                 }
+                last_committed_offset = Some(offset);
+                offset += 1;
+            }
+            if let Some(offset) = last_committed_offset {
+                result.insert(key.to_owned(), offset);
             }
         }
         Ok(result)
