@@ -1,5 +1,5 @@
 use crate::kv::KV;
-use crate::message::{Message, MessageType};
+use crate::message::{Message, MessageType, RpcError};
 use crate::{log, transaction};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -146,8 +146,8 @@ impl Node {
                             eprintln!("retry: {}", err);
                             continue;
                         }
-                        match seq_kv.read(GLOBAL_COUNTER_KEY) {
-                            Ok(value) => break value.as_u64().unwrap_or(0),
+                        match seq_kv.read_optional(GLOBAL_COUNTER_KEY) {
+                            Ok(value) => break value.and_then(|v| v.as_u64()).unwrap_or(0),
                             Err(err) => eprintln!("retry: {}", err),
                         }
                     };
@@ -339,7 +339,7 @@ impl Node {
         // TODO: maybe add a timeout for this, right now is waiting permanently
         let message = rx.recv()?;
         if let Some((code, text)) = message.is_rpc_error() {
-            bail!("Rpc error: code={}, text={}", code, text);
+            return Err(RpcError { code, text }.into());
         }
         Ok(message)
     }

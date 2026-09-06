@@ -39,9 +39,24 @@ pub enum MessageType {
 }
 
 #[repr(u64)]
-enum RpcCode {
+pub enum RpcCode {
     Crash = 13,
+    KeyDoesNotExist = 20,
 }
+
+#[derive(Debug)]
+pub struct RpcError {
+    pub code: u64,
+    pub text: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rpc error: code={}, text={}", self.code, self.text)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 // TODO: maybe have a new from reading the line
 impl Message {

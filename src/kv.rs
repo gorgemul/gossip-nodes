@@ -1,3 +1,4 @@
+use crate::message::{RpcCode, RpcError};
 use crate::node::Node;
 use anyhow::Result;
 use serde::Serialize;
@@ -36,6 +37,15 @@ impl<'a> KV<'a> {
         body.insert(String::from("key"), json!(key));
         let message = self.node.rpc_sync(&self.kind.to_string(), body)?;
         Ok(message.get_body_value_raw("value")?.to_owned())
+    }
+    pub fn read_optional(&self, key: &str) -> Result<Option<Value>> {
+        match self.read(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(err) => match err.downcast_ref::<RpcError>() {
+                Some(rpc_err) if rpc_err.code == RpcCode::KeyDoesNotExist as u64 => Ok(None),
+                _ => Err(err),
+            },
+        }
     }
     pub fn write<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
         let mut body: HashMap<String, Value> = HashMap::new();
